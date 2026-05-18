@@ -17,7 +17,6 @@ nginx/nginx-1.26.0/temp/
 nginx/nginx-1.26.0/logs/nginx.pid
 
 results.csv
-*.pdf
 jmeter_report/
 
 .vscode/
