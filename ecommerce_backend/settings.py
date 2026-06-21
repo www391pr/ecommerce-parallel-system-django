@@ -22,12 +22,11 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "django_prometheus.middleware.PrometheusBeforeMiddleware",
-
+    "store.middleware.profiler.SafeTimingMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "ecommerce_backend.resource_middleware.ResourceManagerMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
-
     "django_prometheus.middleware.PrometheusAfterMiddleware",
 ]
 
@@ -56,6 +55,16 @@ DATABASES = {
         "OPTIONS": {
             "charset": "utf8mb4",
         },
+    }
+}
+
+CACHES = {
+    "default": {
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": "redis://127.0.0.1:6379/2",
+        "OPTIONS": {
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
+        }
     }
 }
 

@@ -13,16 +13,19 @@ logger = logging.getLogger(__name__)
 
 @shared_task(
     bind=True,
-    acks_late=True,
+    acks_late=True,                 
 )
 def process_checkout_task(self, order_id: int, user_id: int):
     try:
         with transaction.atomic():
+            
             order = Order.objects.select_for_update().get(pk=order_id)
+            
             
             if order.status != "pending":
                 logger.info(f"Order {order_id} already processed (status: {order.status}). Skipping duplicate message.")
                 return
+            
             
             cart = Cart.objects.select_for_update().filter(user_id=user_id).first()
             if not cart:
@@ -39,6 +42,7 @@ def process_checkout_task(self, order_id: int, user_id: int):
             product_ids = [item.product_id for item in cart_items]
             products_by_id = {
                 product.id: product
+                for product in Product.objects.select_for_update()
                 .filter(pk__in=product_ids)
                 .order_by("id")
             }
@@ -59,12 +63,15 @@ def process_checkout_task(self, order_id: int, user_id: int):
                 total_price += subtotal
                 order_items_data.append((cart_item, product, unit_price, subtotal))
 
+            
             process_payment(user_id=user_id, total_cart_price=total_price)
 
+            
             order.total_price = float(total_price)
             order.status = "completed"
             order.save(update_fields=["total_price", "status"])
 
+            
             for cart_item, product, unit_price, subtotal in order_items_data:
                 product.stock_quantity -= cart_item.quantity
                 product.save(update_fields=["stock_quantity"])
@@ -76,8 +83,10 @@ def process_checkout_task(self, order_id: int, user_id: int):
                     subtotal=float(subtotal),
                 )
 
+            
             CartItem.objects.filter(cart=cart).delete()
 
+            
             transaction.on_commit(
                 lambda: send_notification.delay(
                     event="order_checkout",
@@ -88,22 +97,31 @@ def process_checkout_task(self, order_id: int, user_id: int):
             )
 
     except Order.DoesNotExist:
+        
         logger.warning(f"Order {order_id} does not exist. Skipping.")
         return
     except (ValueError, BadRequest, NotFound) as e:
-        Order.objects.filter(pk=order_id).update(status="failed")
+        
+        
+        Order.objects.filter(pk=order_id).update(status="failed", error_message=str(e))
         return
     except Exception as e:
+        
         err_msg = str(e).lower()
         if "money" in err_msg or "balance" in err_msg or "stock" in err_msg or "empty" in err_msg or "exist" in err_msg:
             logger.warning(f"Non-retriable failure for Order {order_id}: {e}")
-            Order.objects.filter(pk=order_id).update(status="failed")
+            Order.objects.filter(pk=order_id).update(status="failed", error_message=str(e))
             return
 
+        
+        
         try:
+            
             backoff_delay = 2 ** self.request.retries 
+            
             self.retry(exc=e, countdown=backoff_delay, max_retries=3)
         except self.MaxRetriesExceededError:
+            
             logger.error(f"CRITICAL: Order {order_id} failed completely after 3 retries. Error: {e}")
-            Order.objects.filter(pk=order_id).update(status="failed")
+            Order.objects.filter(pk=order_id).update(status="failed", error_message=str(e))
 

@@ -14,10 +14,13 @@ MAX_QUEUE_SIZE = getattr(settings, "SYSTEM_MAX_QUEUE_SIZE", 100)
 IDLE_TIMEOUT = 10
 
 class ResourceManager:
+
     def __init__(self) -> None:
         self._total_capacity = MAX_WORKERS + MAX_QUEUE_SIZE
         
+        
         self._admission = BoundedSemaphore(self._total_capacity)
+        
         
         self._workers = BoundedSemaphore(MAX_WORKERS)
 
@@ -38,6 +41,7 @@ class ResourceManager:
         )
 
     def acquire(self) -> bool:
+        
         admitted = self._admission.acquire(blocking=False)
         if not admitted:
             with self._lock:
@@ -49,11 +53,13 @@ class ResourceManager:
             self._waiting += 1
             self._sync_prometheus()
 
+        
         self._workers.acquire(blocking=True)
 
         with self._lock:
             self._waiting -= 1
             self._running += 1
+            
             
             if self._running > self._spawned:
                 self._spawned = self._running
@@ -75,6 +81,7 @@ class ResourceManager:
 
     def get_metrics(self) -> dict:
         with self._lock:
+            
             now = time.time()
             if now - self._last_active >= IDLE_TIMEOUT:
                 if self._spawned > self._running:

@@ -10,12 +10,21 @@ from django.conf import settings
 from django.http import HttpResponse, JsonResponse
 from django.urls import include, path
 
-from ecommerce_backend.openapi import OPENAPI_SCHEMA
 from ecommerce_backend.resource_manager import resource_manager
 from store.models import Order, DailySalesReport, DeadLetterSales
 
 from prometheus_client import REGISTRY
 from prometheus_client.core import GaugeMetricFamily
+
+def _get_active_db_connections():
+    try:
+        from django.db import connection
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW STATUS LIKE 'Threads_connected';")
+            row = cursor.fetchone()
+            return int(row[1]) if row else 0
+    except Exception:
+        return 0
 
 class WindowsProcessCollector:
     def __init__(self):
@@ -126,22 +135,46 @@ class WindowsProcessCollector:
                 yield g_batch_dl
         except Exception:
             pass
+        try:
+            g_db_conns = GaugeMetricFamily("django_db_active_connections", "Number of active database connections")
+            g_db_conns.add_metric([], _get_active_db_connections())
+            yield g_db_conns
+        except Exception:
+            pass
+        try:
+            cache_data = _get_cache_metrics()
+            g_cache_hits = GaugeMetricFamily("django_redis_cache_hits", "Total cache hits")
+            g_cache_hits.add_metric([], cache_data["hits"])
+            yield g_cache_hits
+            
+            g_cache_misses = GaugeMetricFamily("django_redis_cache_misses", "Total cache misses")
+            g_cache_misses.add_metric([], cache_data["misses"])
+            yield g_cache_misses
+            
+            g_cache_ratio = GaugeMetricFamily("django_redis_cache_hit_ratio_percent", "Cache hit ratio percentage")
+            g_cache_ratio.add_metric([], cache_data["hit_ratio_percent"])
+            yield g_cache_ratio
+        except Exception:
+            pass
 
 try:
     REGISTRY.register(WindowsProcessCollector())
 except ValueError:
     pass
 
+
 _GLOBAL_PROCESS = psutil.Process(os.getpid())
 _GLOBAL_PROCESS.cpu_percent(interval=None)
 psutil.cpu_percent(interval=None)
 _METRICS_LOCK = Lock()
+
 
 import time
 _LAST_CPU_TIME = 0.0
 _CACHED_CPU = 0.0
 _LAST_SYSTEM_CPU_TIME = 0.0
 _CACHED_SYSTEM_CPU = 0.0
+
 
 _ASYNC_CHECKOUT_LOCK = Lock()
 _LAST_ASYNC_CHECKOUT_FETCH = 0.0
@@ -158,9 +191,6 @@ def root_view(request):
     return JsonResponse({"message": "E-commerce API is running"})
 
 
-def openapi_view(request):
-    return JsonResponse(OPENAPI_SCHEMA)
-
 
 def _local_metrics_payload(server_url=None, online=True, error=None, exclude_db=False):
     global _GLOBAL_PROCESS, _METRICS_LOCK, _LAST_CPU_TIME, _CACHED_CPU, _LAST_SYSTEM_CPU_TIME, _CACHED_SYSTEM_CPU
@@ -169,9 +199,11 @@ def _local_metrics_payload(server_url=None, online=True, error=None, exclude_db=
     try:
         now = time.time()
         with _METRICS_LOCK:
+            
             if now - _LAST_CPU_TIME >= 1.0:
                 _CACHED_CPU = _GLOBAL_PROCESS.cpu_percent(interval=None)
                 _LAST_CPU_TIME = now
+            
             if now - _LAST_SYSTEM_CPU_TIME >= 1.0:
                 _CACHED_SYSTEM_CPU = psutil.cpu_percent(interval=None)
                 _LAST_SYSTEM_CPU_TIME = now
@@ -188,6 +220,7 @@ def _local_metrics_payload(server_url=None, online=True, error=None, exclude_db=
         system_memory = 0.0
 
     now = time.time()
+    
     if now - _LAST_ASYNC_CHECKOUT_FETCH >= 5.0:
         if _ASYNC_CHECKOUT_LOCK.acquire(blocking=False):
             try:
@@ -200,6 +233,7 @@ def _local_metrics_payload(server_url=None, online=True, error=None, exclude_db=
             finally:
                 _ASYNC_CHECKOUT_LOCK.release()
 
+    
     if now - _LAST_DAILY_BATCH_FETCH >= 5.0:
         if _DAILY_BATCH_LOCK.acquire(blocking=False):
             try:
@@ -223,6 +257,7 @@ def _local_metrics_payload(server_url=None, online=True, error=None, exclude_db=
         },
         "system": resource_manager.get_metrics(),
         "checkout_queue": None,
+        "db_active_connections": _get_active_db_connections(),
         "error": error,
         "async_checkout": {
             "pending_orders": _CACHED_PENDING,
@@ -230,6 +265,7 @@ def _local_metrics_payload(server_url=None, online=True, error=None, exclude_db=
             "failed_orders": _CACHED_FAILED,
         },
         "daily_batch": _CACHED_DAILY_BATCH,
+        "cache_metrics": _get_cache_metrics(),
     }
     return payload
 
@@ -250,6 +286,24 @@ def _get_daily_batch_metrics():
     }
 
 
+def _get_cache_metrics():
+    from django.core.cache import cache
+    try:
+        redis_client = cache.client.get_client()
+        info = redis_client.info('stats')
+        hits = info.get('keyspace_hits', 0)
+        misses = info.get('keyspace_misses', 0)
+        total = hits + misses
+        hit_ratio = (hits / total * 100.0) if total > 0 else 0.0
+        return {
+            "hits": hits,
+            "misses": misses,
+            "hit_ratio_percent": round(hit_ratio, 2)
+        }
+    except Exception:
+        return {"hits": 0, "misses": 0, "hit_ratio_percent": 0.0}
+
+
 def system_local_metrics_view(request):
     server_url = f"{request.scheme}://{request.get_host()}"
     exclude_db = request.GET.get("exclude_db", "false").lower() == "true"
@@ -265,6 +319,7 @@ def _fetch_server_metrics(server_url, current_url, exclude_db=False):
         metrics_url += "?exclude_db=true"
     request = Request(metrics_url, headers={"Accept": "application/json"})
     try:
+        
         with urlopen(request, timeout=1.0) as response:
             payload = json.loads(response.read().decode("utf-8"))
             payload["server"]["url"] = server_url
@@ -279,6 +334,7 @@ def _fetch_server_metrics(server_url, current_url, exclude_db=False):
             },
             "system": None,
             "checkout_queue": None,
+            "db_active_connections": 0,
             "async_checkout": None,
             "error": str(exc),
         }
@@ -290,6 +346,7 @@ def system_metrics_view(request):
     current_url = f"{request.scheme}://{request.get_host()}"
     server_urls = getattr(settings, "MONITORED_SERVER_URLS", [current_url])
     exclude_db = request.GET.get("exclude_db", "false").lower() == "true"
+    
     
     with ThreadPoolExecutor(max_workers=len(server_urls)) as executor:
         servers = list(executor.map(
@@ -320,22 +377,22 @@ def system_dashboard_view(request):
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
-      body { margin: 0; font-family: Arial, sans-serif; background: #f6f7f9; color: #1f2937; }
+      body { margin: 0; font-family: Arial, sans-serif; background: 
       main { max-width: 1100px; margin: 0 auto; padding: 24px; }
       h1 { font-size: 26px; margin: 0 0 6px; }
       h2 { margin-top: 26px; }
       h3 { margin: 18px 0 10px; }
-      .updated { color: #6b7280; margin-bottom: 18px; }
+      .updated { color: 
       .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
-      .metric { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px; }
-      .label { color: #6b7280; font-size: 13px; margin-bottom: 8px; overflow-wrap: anywhere; }
+      .metric { background: 
+      .label { color: 
       .value { font-size: 28px; font-weight: 700; overflow-wrap: anywhere; }
-      .server { background: #fff; border: 1px solid #d1d5db; border-radius: 8px; padding: 16px; margin-top: 14px; }
+      .server { background: 
       .server-header { display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 12px; }
       .status { border-radius: 999px; padding: 4px 10px; font-size: 13px; font-weight: 700; }
-      .online { background: #dcfce7; color: #166534; }
-      .offline { background: #fee2e2; color: #991b1b; }
-      pre { overflow: auto; background: #111827; color: #f9fafb; padding: 14px; border-radius: 8px; }
+      .online { background: 
+      .offline { background: 
+      pre { overflow: auto; background: 
     </style>
   </head>
   <body>
@@ -366,21 +423,13 @@ def system_dashboard_view(request):
         max_workers: "Max workers (Limit)",
         spawned_threads: "Total Threads Alive",
         running_threads: "Busy Threads (Processing)",
-        idle_waiting_to_die: "Idle Threads (Ready & Waiting)",
-        max_queue_size: "Queue capacity",
-        waiting_requests: "Waiting requests",
-        remaining_queue_slots: "Remaining queue slots",
-        total_capacity: "Total capacity",
-        total_in_system: "Total in system",
-        remaining_capacity: "Remaining capacity",
-        rejected_total: "Rejected",
-        waiting_tasks: "Checkout in queue",
-        running_tasks: "Checkout processing",
-        tracked_jobs: "Tracked jobs",
-        enqueued_total: "Checkout requests in",
-        completed_total: "Checkout done",
-        failed_total: "Checkout failed",
-        worker_alive: "Checkout worker alive",
+        idle_waiting_to_die: "Idle Worker Threads",
+        max_queue_size: "Queue Capacity",
+        waiting_requests: "Requests Waiting",
+        remaining_queue_slots: "Queue Slots Remaining",
+        total_capacity: "Max System Concurrency",
+        rejected_total: "Lifetime Rejections",
+        db_active_connections: "Active DB Connections",
         pending_orders: "Pending Orders (In Queue)",
         completed_orders: "Completed Orders",
         failed_orders: "Failed Orders",
@@ -394,7 +443,10 @@ def system_dashboard_view(request):
         cpu_percent: "Process CPU Usage",
         memory_mb: "Process Memory Usage",
         system_cpu_percent: "Global System CPU",
-        system_memory_percent: "Global System Memory"
+        system_memory_percent: "Global System Memory",
+        hits: "Cache Hits (Total)",
+        misses: "Cache Misses (Total)",
+        hit_ratio_percent: "Cache Hit Ratio (%)"
       };
 
       function metricCards(data) {
@@ -449,9 +501,8 @@ def system_dashboard_view(request):
             <h3>System Totals</h3>
             <div class="grid">${metricCards(server.system ? {
               total_capacity: server.system.total_capacity,
-              total_in_system: server.system.total_in_system,
-              remaining_capacity: server.system.remaining_capacity,
-              rejected_total: server.system.rejected_total
+              rejected_total: server.system.rejected_total,
+              db_active_connections: server.db_active_connections !== undefined ? server.db_active_connections : "N/A"
             } : null)}</div>
             <h3>Checkout Queue (Legacy)</h3>
             <div class="grid">${metricCards(server.checkout_queue || {})}</div>
@@ -459,6 +510,8 @@ def system_dashboard_view(request):
             <div class="grid">${metricCards(server.async_checkout || {})}</div>
             <h3>Daily Sales Batch (Latest)</h3>
             <div class="grid">${metricCards(server.daily_batch || {"status": "No reports yet"})}</div>
+            <h3>Redis Cache Performance</h3>
+            <div class="grid">${metricCards(server.cache_metrics || {})}</div>
           </div>
         `;
       }
@@ -483,33 +536,10 @@ def system_dashboard_view(request):
     return HttpResponse(html)
 
 
-def scalar_docs_view(request):
-    html = """
-<!doctype html>
-<html>
-  <head>
-    <title>E-commerce Backend - Scalar</title>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-  </head>
-  <body>
-    <script
-      id="api-reference"
-      data-url="/openapi.json"
-      data-theme="default"
-    ></script>
-    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
-  </body>
-</html>
-"""
-    return HttpResponse(html)
-
 
 urlpatterns = [
     path("", include("django_prometheus.urls")),
     path("", root_view),
-    path("docs", scalar_docs_view, name="scalar-docs"),
-    path("openapi.json", openapi_view, name="openapi-schema"),
     path("system/local-metrics", system_local_metrics_view, name="system-local-metrics"),
     path("system/metrics", system_metrics_view, name="system-metrics"),
     path("system/dashboard", system_dashboard_view, name="system-dashboard"),

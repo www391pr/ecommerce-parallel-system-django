@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 from random import Random
 
+
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "ecommerce_backend.settings")
 
@@ -110,6 +111,7 @@ def seed_users(session) -> None:
 
 
 def main() -> None:
+    
     seed_products(None)
     seed_users(None)
 
